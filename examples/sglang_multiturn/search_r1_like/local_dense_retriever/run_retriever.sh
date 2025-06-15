@@ -1,3 +1,4 @@
+conda init
 conda activate retriever
 
 save_path=~/dataset

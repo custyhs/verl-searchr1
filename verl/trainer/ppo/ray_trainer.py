@@ -41,22 +41,21 @@ from tqdm import tqdm
 from verl import DataProto
 from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
 from verl.single_controller.base import Worker
-from verl.single_controller.ray import RayClassWithInitArgs, RayResourcePool, RayWorkerGroup
+from verl.single_controller.ray import (RayClassWithInitArgs, RayResourcePool,
+                                        RayWorkerGroup)
 from verl.single_controller.ray.base import create_colocated_worker_cls
 from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.core_algos import agg_loss
-from verl.trainer.ppo.metric_utils import (
-    compute_data_metrics,
-    compute_throughout_metrics,
-    compute_timing_metrics,
-    process_validation_metrics,
-)
+from verl.trainer.ppo.metric_utils import (compute_data_metrics,
+                                           compute_throughout_metrics,
+                                           compute_timing_metrics,
+                                           process_validation_metrics)
 from verl.trainer.ppo.reward import compute_reward, compute_reward_async
-from verl.utils.checkpoint.checkpoint_manager import BaseCheckpointManager, find_latest_ckpt_path
-from verl.utils.metric import (
-    reduce_metrics,
-)
-from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance
+from verl.utils.checkpoint.checkpoint_manager import (BaseCheckpointManager,
+                                                      find_latest_ckpt_path)
+from verl.utils.metric import reduce_metrics
+from verl.utils.seqlen_balancing import (get_seqlen_balanced_partitions,
+                                         log_seqlen_unbalance)
 from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
 from verl.workers.rollout.async_server import AsyncLLMServerManager
@@ -213,6 +212,98 @@ def compute_response_mask(data: DataProto):
     return attention_mask[:, -response_length:]
 
 
+def compute_response_mask_with_plan(data: DataProto, tokenizer):
+    """Compute the attention mask for the response part of the sequence. And when plan_only is True, this function will create a mask based on <plan> </plan> tags in the response.
+    
+    This function extracts the portion of the attention mask that corresponds to the model's response,
+    which is used for masking computations that should only apply to response tokens. 
+    When plan_only is True, this function will create a mask based on <plan> </plan> tags in the response.
+
+    Args:
+        data (DataProto): The data containing batched model outputs and inputs.
+
+    Returns:
+        torch.Tensor: The attention mask for the response tokens.
+    """
+    
+    responses = data.batch["responses"]
+    response_length = responses.size(1)
+    attention_mask = data.batch["attention_mask"]
+    response_mask = attention_mask[:, -response_length:]
+
+    plan_only = data.meta_info["plan_only"]
+    
+    if not plan_only:
+        # If plan_only is False, return the original response mask (no additional masking)
+        return response_mask
+    
+    # Initialize plan mask with zeros (everything masked by default)
+    plan_mask = torch.zeros_like(response_mask, dtype=torch.float32)
+    
+    # tokenizer = data.meta_info["tokenizer"]
+    batch_size = data.batch.batch_size[0]
+    
+    # Define regex pattern to match <plan> content </plan>
+    plan_pattern = r'<plan>(.*?)</plan>'
+    
+    for batch_idx in range(batch_size):
+        # Get valid response tokens (excluding padding)
+        valid_length = int(response_mask[batch_idx].sum().item())
+        if valid_length == 0:
+            continue
+            
+        valid_response_tokens = responses[batch_idx][:valid_length]
+        
+        # Decode response to text
+        try:
+            response_text = tokenizer.decode(valid_response_tokens, skip_special_tokens=False)
+        except Exception as e:
+            # If decoding fails, skip this sample (keep mask as zeros)
+            print(f"Decoding failed for batch {batch_idx}: {e}")
+            continue
+        
+        # Find plan content using regex
+        plan_matches = list(re.finditer(plan_pattern, response_text, re.DOTALL))
+        
+        # If no complete <plan></plan> tags found, skip this sample (keep mask as zeros)
+        if not plan_matches:
+            continue
+            
+        # Process each plan match
+        for match in plan_matches:
+            # Get the content inside <plan> tags (excluding the tags themselves)
+            content_start = match.start(1)  # Start of group 1 (content inside tags)
+            content_end = match.end(1)      # End of group 1
+            
+            # Convert character positions to token positions
+            try:
+                # Encode the text up to content_start to find token start
+                prefix_text = response_text[:content_start]
+                prefix_tokens = tokenizer.encode(prefix_text, add_special_tokens=False)
+                token_start_idx = len(prefix_tokens)
+                
+                # Encode the text up to content_end to find token end
+                content_text = response_text[:content_end]
+                content_tokens = tokenizer.encode(content_text, add_special_tokens=False)
+                token_end_idx = len(content_tokens)
+                
+                # Ensure indices are within bounds
+                token_start_idx = max(0, min(token_start_idx, response_length))
+                token_end_idx = max(token_start_idx, min(token_end_idx, response_length))
+                
+                # Unmask the plan content tokens (set to 1.0)
+                plan_mask[batch_idx, token_start_idx:token_end_idx] = 1.0
+                
+            except Exception as e:
+                # If token position calculation fails, skip this match
+                continue
+    
+    # Apply original response mask to ensure we don't include padding tokens
+    plan_mask = plan_mask * response_mask
+    
+    return plan_mask
+
+
 def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_repeat=1, multi_turn=False, norm_adv_by_std_in_grpo=True, **kwargs):
     """Compute advantage estimates for policy optimization.
 
@@ -233,7 +324,7 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
     """
     # Back-compatible with trainers that do not compute response mask in fit
     if "response_mask" not in data.batch:
-        data.batch["response_mask"] = compute_response_mask(data)
+        data.batch["response_mask"] = compute_response_mask_with_plan(data, self.tokenizer)
     # prepare response group
     # TODO: add other ways to estimate advantages
     if adv_estimator == AdvantageEstimator.GAE:
@@ -551,7 +642,8 @@ class RayPPOTrainer:
         if train_sampler is None:
             train_sampler = create_rl_sampler(self.config.data, self.train_dataset)
         if collate_fn is None:
-            from verl.utils.dataset.rl_dataset import collate_fn as default_collate_fn
+            from verl.utils.dataset.rl_dataset import \
+                collate_fn as default_collate_fn
 
             collate_fn = default_collate_fn
 
@@ -1035,7 +1127,8 @@ class RayPPOTrainer:
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
                     batch = batch.union(gen_batch_output)
 
-                    batch.batch["response_mask"] = compute_response_mask(batch)
+                    batch.meta_info["plan_only"] = self.config.trainer.get("plan_only", False)
+                    batch.batch["response_mask"] = compute_response_mask_with_plan(batch, self.tokenizer)
                     # Balance the number of valid tokens across DP ranks.
                     # NOTE: This usually changes the order of data in the `batch`,
                     # which won't affect the advantage calculation (since it's based on uid),
